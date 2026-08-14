@@ -1,0 +1,17 @@
+# Credentials & secrets
+.env
+*.env
+credentials.json
+*credentials*.json
+
+# n8n local export artifacts (may contain real IDs/tokens if exported differently)
+*.n8n_export.json
+n8n_credentials.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
