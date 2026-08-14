@@ -1,0 +1,321 @@
+{
+  "name": "Reiseanfrage – Telegram/Viber → Claude → Airtable → Manager",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": ["message"]
+      },
+      "id": "trigger-telegram",
+      "name": "Telegram: новое сообщение",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [-1200, 0],
+      "credentials": {
+        "telegramApi": { "id": "PLACEHOLDER", "name": "Telegram Bot - Reisebuero" }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "viber-webhook",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "trigger-viber",
+      "name": "Viber: новое сообщение",
+      "type": "n8n-nodes-base.webhook",a
+      "typeVersion": 2,
+      "position": [-1200, 260],
+      "notes": "Viber-Webhook muss vorher per POST auf https://chatapi.viber.com/pa/set_webhook auf diese URL registriert werden."
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "fields": {
+          "values": [
+            { "name": "channel", "stringValue": "telegram" },
+            { "name": "chat_id", "stringValue": "={{$json[\"message\"][\"chat\"][\"id\"]}}" },
+            { "name": "user_id", "stringValue": "={{$json[\"message\"][\"from\"][\"id\"]}}" },
+            { "name": "text", "stringValue": "={{$json[\"message\"][\"text\"]}}" },
+            { "name": "timestamp", "stringValue": "={{$json[\"message\"][\"date\"]}}" }
+          ]
+        }
+      },
+      "id": "normalize-telegram",
+      "name": "Нормализация (Telegram)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-960, 0]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "fields": {
+          "values": [
+            { "name": "channel", "stringValue": "viber" },
+            { "name": "chat_id", "stringValue": "={{$json[\"sender\"][\"id\"]}}" },
+            { "name": "user_id", "stringValue": "={{$json[\"sender\"][\"id\"]}}" },
+            { "name": "text", "stringValue": "={{$json[\"message\"][\"text\"]}}" },
+            { "name": "timestamp", "stringValue": "={{$json[\"timestamp\"]}}" }
+          ]
+        }
+      },
+      "id": "normalize-viber",
+      "name": "Нормализация (Viber)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-960, 260]
+    },
+    {
+      "parameters": {
+        "operation": "search",
+        "base": { "value": "YOUR_BASE_ID", "mode": "id" },
+        "table": { "value": "Leads", "mode": "list" },
+        "filterByFormula": "={chat_id} = '{{$json[\"chat_id\"]}}'",
+        "options": {}
+      },
+      "id": "airtable-get",
+      "name": "Airtable: получить лид",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [-720, 130],
+      "credentials": {
+        "airtableTokenApi": { "id": "PLACEHOLDER", "name": "Airtable - Leads Base" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Bestehende Konversation + neue Nachricht zusammenführen\nconst existing = $input.first().json;\nconst incoming = $('Нормализация (Telegram)').first()?.json || $('Нормализация (Viber)').first()?.json;\n\nlet history = [];\ntry {\n  history = existing.fields && existing.fields.conversation_history\n    ? JSON.parse(existing.fields.conversation_history)\n    : [];\n} catch (e) { history = []; }\n\nhistory.push({ role: 'user', content: incoming.text });\n\nreturn [{\n  json: {\n    chat_id: incoming.chat_id,\n    channel: incoming.channel,\n    record_id: existing.id || null,\n    known_data: existing.fields ? existing.fields.structured_data || '{}' : '{}',\n    conversation_history: history\n  }\n}];"
+      },
+      "id": "code-prepare-context",
+      "name": "Подготовка контекста для Claude",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-480, 130]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "anthropicApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"claude-sonnet-4-6\",\n  \"max_tokens\": 1000,\n  \"system\": \"Ты — AI-ассистент турагентства. Извлекай структурированные данные из переписки с клиентом о планируемой поездке.\\n\\nОбязательные поля: destination, dates (месяц/период), nights, adults, children, budget, budget_type (total/per_person), meal_plan, region, hotel_category.\\n\\nУже известные данные по этому клиенту: \" + $json.known_data + \"\\n\\nВерни ТОЛЬКО JSON без пояснений:\\n{\\n  \\\"status\\\": \\\"clarifying\\\" | \\\"needs_confirmation\\\" | \\\"complete\\\" | \\\"ready_for_manager\\\",\\n  \\\"structured_data\\\": { ... },\\n  \\\"missing_fields\\\": [...],\\n  \\\"next_question\\\": \\\"...\\\" | null,\\n  \\\"manager_summary\\\": \\\"...\\\" | null\\n}\\n\\nПравила:\\n- status=clarifying, если не хватает обязательных полей — задай ОДИН следующий уточняющий вопрос на языке клиента.\\n- status=needs_confirmation, если ВСЕ обязательные поля только что собраны или изменены и клиент их ещё не подтвердил — next_question должен быть краткой сводкой для подтверждения, например: 'Уточняю: сентябрь, 7 ночей, 2 взрослых, бюджет €2000. Всё верно?'\\n- status=complete, если клиент явно подтвердил ('да', 'верно', 'всё так') собранные данные, но ещё не выразил готовность бронировать.\\n- status=ready_for_manager, если клиент подтвердил данные И явно готов бронировать/платить — заполни manager_summary краткой сводкой.\",\n  \"messages\": {{JSON.stringify($json.conversation_history)}}\n}"
+      },
+      "id": "http-claude",
+      "name": "Claude: анализ и статус",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-240, 130]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.content[0].text;\nconst cleaned = raw.replace(/```json|```/g, '').trim();\nconst parsed = JSON.parse(cleaned);\n\nconst ctx = $('Подготовка контекста для Claude').first().json;\n\nreturn [{\n  json: {\n    chat_id: ctx.chat_id,\n    channel: ctx.channel,\n    record_id: ctx.record_id,\n    status: parsed.status,\n    structured_data: parsed.structured_data,\n    missing_fields: parsed.missing_fields || [],\n    next_question: parsed.next_question,\n    manager_summary: parsed.manager_summary,\n    conversation_history: ctx.conversation_history.concat([{ role: 'assistant', content: raw }])\n  }\n}];"
+      },
+      "id": "code-parse-claude",
+      "name": "Разбор ответа Claude",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [0, 130]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Harte Validierung: Werte, die technisch unmöglich/unsinnig sind\nconst input = $json;\nconst data = input.structured_data || {};\nlet status = input.status;\nlet nextQuestion = input.next_question;\nconst errors = [];\n\nif (data.budget !== undefined && data.budget !== null && (isNaN(data.budget) || Number(data.budget) <= 0)) {\n  errors.push('budget');\n}\nif (data.nights !== undefined && data.nights !== null && (Number(data.nights) < 1 || Number(data.nights) > 60)) {\n  errors.push('nights');\n}\nif (data.adults !== undefined && data.adults !== null && Number(data.adults) < 1) {\n  errors.push('adults');\n}\nif (data.dates && data.dates.month !== undefined && data.dates.month !== null) {\n  const m = Number(data.dates.month);\n  if (m < 1 || m > 12) errors.push('dates.month');\n}\n\nif (errors.length > 0) {\n  status = 'clarifying';\n  nextQuestion = `Кажется, в поле(ях) ${errors.join(', ')} есть ошибка — не могли бы вы уточнить?`;\n}\n\nreturn [{\n  json: {\n    ...input,\n    status,\n    next_question: nextQuestion,\n    validation_errors: errors\n  }\n}];"
+      },
+      "id": "code-validate",
+      "name": "Валидация данных",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [120, 130]
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "base": { "value": "YOUR_BASE_ID", "mode": "id" },
+        "table": { "value": "Leads", "mode": "list" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "chat_id": "={{$json.chat_id}}",
+            "channel": "={{$json.channel}}",
+            "structured_data": "={{JSON.stringify($json.structured_data)}}",
+            "status": "={{$json.status}}",
+            "conversation_history": "={{JSON.stringify($json.conversation_history)}}",
+            "last_updated": "={{$now.toISO()}}"
+          }
+        },
+        "options": {}
+      },
+      "id": "airtable-upsert",
+      "name": "Airtable: сохранить/обновить лид",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [360, 130],
+      "credentials": {
+        "airtableTokenApi": { "id": "PLACEHOLDER", "name": "Airtable - Leads Base" }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "combinator": "or",
+                "conditions": [
+                  { "leftValue": "={{$json.status}}", "rightValue": "clarifying", "operator": { "type": "string", "operation": "equals" } },
+                  { "leftValue": "={{$json.status}}", "rightValue": "needs_confirmation", "operator": { "type": "string", "operation": "equals" } }
+                ]
+              },
+              "outputKey": "ask_client"
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  { "leftValue": "={{$json.status}}", "rightValue": "ready_for_manager", "operator": { "type": "string", "operation": "equals" } }
+                ]
+              },
+              "outputKey": "ready_for_manager"
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  { "leftValue": "={{$json.status}}", "rightValue": "complete", "operator": { "type": "string", "operation": "equals" } }
+                ]
+              },
+              "outputKey": "complete"
+            }
+          ]
+        }
+      },
+      "id": "switch-status",
+      "name": "Switch: статус лида",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [600, 130]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "leftValue": "={{$json.channel}}", "rightValue": "telegram", "operator": { "type": "string", "operation": "equals" } }
+          ]
+        }
+      },
+      "id": "if-channel-telegram",
+      "name": "If: канал = Telegram",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [840, -40]
+    },
+    {
+      "parameters": {
+        "chatId": "={{$json.chat_id}}",
+        "text": "={{$json.next_question}}"
+      },
+      "id": "telegram-send-question",
+      "name": "Telegram: уточняющий вопрос",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1080, -140],
+      "credentials": {
+        "telegramApi": { "id": "PLACEHOLDER", "name": "Telegram Bot - Reisebuero" }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://chatapi.viber.com/pa/send_message",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Viber-Auth-Token", "value": "={{$credentials.viberToken}}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"receiver\": \"{{$json.chat_id}}\",\n  \"type\": \"text\",\n  \"sender\": { \"name\": \"Reisebuero\" },\n  \"text\": \"{{$json.next_question}}\"\n}"
+      },
+      "id": "viber-send-question",
+      "name": "Viber: уточняющий вопрос",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1080, 60]
+    },
+    {
+      "parameters": {
+        "chatId": "MANAGER_CHAT_ID",
+        "text": "=Новая готовая заявка!\\n\\n{{$json.manager_summary}}\\n\\nchat_id клиента: {{$json.chat_id}} ({{$json.channel}})"
+      },
+      "id": "telegram-notify-manager",
+      "name": "Telegram: уведомить менеджера",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [840, 320],
+      "credentials": {
+        "telegramApi": { "id": "PLACEHOLDER", "name": "Telegram Bot - Reisebuero" }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "noop-complete",
+      "name": "Нет действия (данные собраны)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [840, 130]
+    }
+  ],
+  "connections": {
+    "Telegram: новое сообщение": {
+      "main": [[{ "node": "Нормализация (Telegram)", "type": "main", "index": 0 }]]
+    },
+    "Viber: новое сообщение": {
+      "main": [[{ "node": "Нормализация (Viber)", "type": "main", "index": 0 }]]
+    },
+    "Нормализация (Telegram)": {
+      "main": [[{ "node": "Airtable: получить лид", "type": "main", "index": 0 }]]
+    },
+    "Нормализация (Viber)": {
+      "main": [[{ "node": "Airtable: получить лид", "type": "main", "index": 0 }]]
+    },
+    "Airtable: получить лид": {
+      "main": [[{ "node": "Подготовка контекста для Claude", "type": "main", "index": 0 }]]
+    },
+    "Подготовка контекста для Claude": {
+      "main": [[{ "node": "Claude: анализ и статус", "type": "main", "index": 0 }]]
+    },
+    "Claude: анализ и статус": {
+      "main": [[{ "node": "Разбор ответа Claude", "type": "main", "index": 0 }]]
+    },
+    "Разбор ответа Claude": {
+      "main": [[{ "node": "Валидация данных", "type": "main", "index": 0 }]]
+    },
+    "Валидация данных": {
+      "main": [[{ "node": "Airtable: сохранить/обновить лид", "type": "main", "index": 0 }]]
+    },
+    "Airtable: сохранить/обновить лид": {
+      "main": [[{ "node": "Switch: статус лида", "type": "main", "index": 0 }]]
+    },
+    "Switch: статус лида": {
+      "main": [
+        [{ "node": "If: канал = Telegram", "type": "main", "index": 0 }],
+        [{ "node": "Telegram: уведомить менеджера", "type": "main", "index": 0 }],
+        [{ "node": "Нет действия (данные собраны)", "type": "main", "index": 0 }]
+      ]
+    },
+    "If: канал = Telegram": {
+      "main": [
+        [{ "node": "Telegram: уточняющий вопрос", "type": "main", "index": 0 }],
+        [{ "node": "Viber: уточняющий вопрос", "type": "main", "index": 0 }]
+      ]
+    }
+  }
+}
